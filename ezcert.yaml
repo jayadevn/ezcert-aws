@@ -1,0 +1,231 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Launches an environment for requesting certificates from LetsEncrypt and securing them in your AWS account
+Parameters:
+    Route53HostedZoneName:
+        Type: String
+        Description: Hosted zone for your domain, e.g. "example.com."  Include the trailing dot.
+    Subdomain:
+        Type: String
+        Description: Subdomain for which you will be requesting the certificate, e.g. "foo" if you want a certificate for "foo.example.com"
+    EmailAddress:
+        Type: String
+        Description: LetsEncrypt wants this email address when it issues you a cert.
+    S3Bucket:
+        Type: String
+        Description: Name of the S3 bucket to which the certificate and private key will be delivered.  This S3 bucket must be KMS-encrypted.
+    KMSMasterKeyId:
+        Type: String
+        Description: KMS key ID with which the S3 bucket encryption was configured.  This is the GUID, not the friendly name.
+    PublicSubnetId:
+        Type: AWS::EC2::Subnet::Id
+        Description: Subnet for EC2 instance.  Make sure it has a route to an Internet Gateway.
+    VpcId:
+        Type: AWS::EC2::VPC::Id
+        Description: VPC for EC2 instance.
+    SSHKeyName:
+        Type: AWS::EC2::KeyPair::KeyName
+        Description: SSH key you will use to connect to your instance
+    SSHAccessRange:
+        Type: String
+        Description: CIDR range from which you will connect to your instance, for example 98.97.96.95/32.
+Mappings:
+    RegionMap:
+        us-east-1:
+            UbuntuAmi: ami-aa2ea6d0
+Resources:
+    EIP:
+        Type: AWS::EC2::EIP
+        Properties:
+            Domain: vpc
+    DNSRecord:
+        Type: AWS::Route53::RecordSet
+        Properties:
+            HostedZoneName: !Ref Route53HostedZoneName
+            Name: !Sub ${Subdomain}.${Route53HostedZoneName}
+            Comment: DNS record auto-created for certbot certificate validation
+            Type: A
+            TTL: 30
+            ResourceRecords:
+                - !Ref EIP
+    SecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupDescription: Allows HTTP access from anywhere and SSH access from specified range
+            VpcId: !Ref VpcId
+            SecurityGroupIngress:
+                - CidrIp: !Ref SSHAccessRange
+                  FromPort: 22
+                  ToPort: 22
+                  IpProtocol: tcp
+                - CidrIp: 0.0.0.0/0
+                  FromPort: 80
+                  ToPort: 80
+                  IpProtocol: tcp
+    ENI:
+        Type: AWS::EC2::NetworkInterface
+        Properties:
+            GroupSet:
+                - !GetAtt SecurityGroup.GroupId
+            SubnetId: !Ref PublicSubnetId
+    EIPAssocciation:
+        Type: AWS::EC2::EIPAssociation
+        Properties:
+            AllocationId: !GetAtt EIP.AllocationId
+            NetworkInterfaceId: !Ref ENI
+    Role:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service:
+                              - "ec2.amazonaws.com"
+                      Action:
+                          - "sts:AssumeRole"
+            Path: "/"
+            Policies:
+                - PolicyName: certbot
+                  PolicyDocument:
+                    Version: "2012-10-17"
+                    Statement:
+                        - Effect: Allow
+                          Action:
+                              - "s3:GetEncryptionConfiguration"
+                          Resource: !Sub "arn:aws:s3:::${S3Bucket}"
+                        - Effect: Allow
+                          Action:
+                              - "s3:PutObject"
+                          Resource: !Sub "arn:aws:s3:::${S3Bucket}/*"
+                        - Effect: Allow
+                          Action:
+                              - "kms:GenerateDataKey"
+                              - "kms:GetKeyPolicy"
+                              - "kms:Encrypt"
+                          Resource: !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/${KMSMasterKeyId}"
+    InstanceProfile:
+        Type: AWS::IAM::InstanceProfile
+        Properties:
+            Path: "/"
+            Roles:
+                - !Ref Role
+    Instance:
+        Type: AWS::EC2::Instance
+        DependsOn: DNSRecord
+        Properties:
+            ImageId: !FindInMap [ RegionMap, !Ref "AWS::Region", UbuntuAmi ]
+            InstanceType: t2.nano
+            IamInstanceProfile: !Ref InstanceProfile
+            NetworkInterfaces:
+                - NetworkInterfaceId: !Ref ENI
+                  DeviceIndex: 0
+            KeyName: !Ref SSHKeyName
+            Tags:
+                - Key: Name
+                  Value: Certbot instance
+            UserData:
+                Fn::Base64: !Sub |
+                    #!/bin/bash -x
+                    add-apt-repository ppa:certbot/certbot -y
+                    apt-get update -y
+                    apt-get install certbot -y
+                    apt-get install ruby -y
+                    gem install aws-sdk
+                    echo Started at $(date -u) > /home/ubuntu/start.txt
+                    cat << END > /home/ubuntu/ezcert.rb
+                    #!/usr/bin/ruby
+                    require 'aws-sdk'
+
+                    unless Process::uid == 0
+                        STDERR.puts "Please run this script as root; certbot requires it"
+                        exit 1
+                    end
+
+                    DNS_NAME = "${Subdomain}.${Route53HostedZoneName}"
+                    DNS_NAME.slice! -1
+                    LETSENCRYPT_DIR = "/etc/letsencrypt/live/#{DNS_NAME}/"
+                    
+                    S3_BUCKET = "${S3Bucket}"
+                    S3_PREFIX = "#{DNS_NAME}/"
+                    EXPECTED_KMS_MASTER_KEY_ID = "${KMSMasterKeyId}"
+
+                    Aws.config.update :region => '${AWS::Region}'
+                    s3 = Aws::S3::Client.new
+                    kms = Aws::KMS::Client.new
+
+                    puts "Checking bucket encryption settings for #{S3_BUCKET}..."
+                    r = s3.get_bucket_encryption :bucket => S3_BUCKET
+                    encryption_rules = r.server_side_encryption_configuration.rules
+                    kms_master_key_id = nil
+                    if encryption_rules &&
+                       encryption_rules.first &&
+                       encryption_rules.first.apply_server_side_encryption_by_default &&
+                       encryption_rules.first.apply_server_side_encryption_by_default.kms_master_key_id
+                        kms_master_key_arn = encryption_rules.first.apply_server_side_encryption_by_default.kms_master_key_id
+                        m = kms_master_key_arn.match /key\/(.*)/
+                        kms_master_key_id = m && m[1]
+                    else
+                        STDERR.puts "Bucket #{S3_BUCKET} is not KMS-encrypted"
+                        STDERR.puts r
+                    end
+                    unless kms_master_key_id == EXPECTED_KMS_MASTER_KEY_ID
+                        STDERR.puts "KMS master key #{kms_master_key_id} for #{S3_BUCKET} does not match #{EXPECTED_KMS_MASTER_KEY_ID}; exiting"
+                        exit 1
+                    end
+                    puts "S3 bucket #{S3_BUCKET} is encrypted with #{kms_master_key_id}.  Continuing."
+                    puts
+
+                    puts "Retrieving KMS key policy for key #{kms_master_key_id}..."
+                    begin
+                        r = kms.get_key_policy(
+                          :key_id => kms_master_key_id,
+                          :policy_name => "default"
+                        )
+                        puts "Policy for key #{kms_master_key_id}:"
+                        puts r.policy
+                        puts "Please inspect the above policy to verify that these are the permissions that you want"
+                    rescue Aws::KMS::Errors::ServiceError => e
+                        puts "Failed to retrieve policy for key #{kms_master_key_id} due to #{e}.  Non-fatal, but please go to the AWS console to verify that this key has the policy you want."
+                    end
+                    puts "Proceed with this policy? [y/N]"
+                    yn = STDIN.gets.chomp
+                    unless yn[0] == 'y'
+                        STDERR.puts "Canceled"
+                        exit 1
+                    end
+                    puts
+
+                    puts "Testing S3 write access to #{S3_BUCKET}/#{S3_PREFIX}start.txt..."
+                    s3.put_object(
+                        :body => '/home/ubuntu/start.txt',
+                        :bucket => S3_BUCKET,
+                        :key => "#{S3_PREFIX}start.txt"
+                    )
+                    puts "OK.  Continuing."
+                    puts
+
+                    if File::exists? "#{LETSENCRYPT_DIR}/privkey.pem"
+                        puts "You already have a certificate at #{LETSENCRYPT_DIR}; not generating a new one."
+                    else
+                        success = system "certbot certonly -n --standalone --preferred-challenges http --http-01-port 80 -d #{DNS_NAME} --email ${EmailAddress} --agree-tos"
+                        unless success
+                            STDERR.puts "Certbot failed; exiting"
+                            exit 1
+                        end
+                    end
+                    puts
+
+                    ["cert.pem", "chain.pem", "fullchain.pem", "privkey.pem"].each do |f|
+                        certfile_path = "#{LETSENCRYPT_DIR}#{f}"
+                        s3_key = "#{S3_PREFIX}#{f}"
+                        puts "Uploading #{certfile_path} to #{S3_BUCKET}/#{s3_key}..."
+                        s3.put_object :body => certfile_path, :bucket => S3_BUCKET, :key => s3_key
+                    end
+                    puts
+
+                    puts "All done!  Your certificate materials are encrypted at #{S3_BUCKET}/#{S3_PREFIX}"
+                                        
+                        
+                    END
+                    chmod 755 /home/ubuntu/ezcert.rb
